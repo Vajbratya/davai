@@ -2411,10 +2411,10 @@ install_globally() {
         fi
     fi
 
-    local target="$install_dir/ralph"
+    local target="$install_dir/davai"
 
     echo ""
-    echo "  ${CYAN}${BOLD}Installing RALPH globally...${RESET}"
+    echo "  ${CYAN}${BOLD}Installing DAVAI globally...${RESET}"
     echo ""
 
     # Copy script
@@ -2446,21 +2446,21 @@ install_globally() {
     echo ""
     echo "  ${GREEN}${BOLD}Installation complete!${RESET}"
     echo ""
-    echo "  Run ${CYAN}ralph${RESET} from any directory to start."
+    echo "  Run ${CYAN}davai${RESET} from any directory to start."
     echo ""
 }
 
 uninstall_globally() {
     local -a locations=(
-        "$HOME/.local/bin/ralph"
-        "$HOME/bin/ralph"
-        "/usr/local/bin/ralph"
+        "$HOME/.local/bin/davai"
+        "$HOME/bin/davai"
+        "/usr/local/bin/davai"
     )
 
     local found=0
 
     echo ""
-    echo "  ${CYAN}${BOLD}Uninstalling RALPH...${RESET}"
+    echo "  ${CYAN}${BOLD}Uninstalling DAVAI...${RESET}"
     echo ""
 
     for loc in "${locations[@]}"; do
