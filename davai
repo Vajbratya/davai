@@ -1855,6 +1855,22 @@ reset_workspace() {
 #───────────────────────────────────────────────────────────────────────────────
 run_execution_loop() {
     local fails=0
+    local start_time
+    start_time=$(date +%s)
+
+    # Send start webhook
+    local feature_name
+    feature_name=$(jq -r '.feature // "Feature"' "$PRD_FILE" 2>/dev/null)
+    local total_stories
+    total_stories=$(jq '.stories | length' "$PRD_FILE" 2>/dev/null || echo 0)
+    send_webhook "start" "DAVAI Started" "Working on: $feature_name ($total_stories stories)"
+    emit_event "execution_start" "{\"feature\":\"$feature_name\",\"stories\":$total_stories}"
+
+    # Use parallel execution if configured
+    if ((RALPH_PARALLEL > 1)); then
+        run_parallel_stories
+        return
+    fi
 
     while ((RUN_ACTIVE)); do
         # Check for pause
@@ -1874,46 +1890,92 @@ run_execution_loop() {
 
             if ((remaining == 0)); then
                 RUN_ACTIVE=0
+                local elapsed=$(( $(date +%s) - start_time ))
+                local done_count
+                done_count=$(jq '[.stories[] | select(.done)] | length' "$PRD_FILE" 2>/dev/null || echo 0)
+
+                # Generate PR summary
+                generate_pr_summary
+
+                # Completion notifications
                 show_notification "All stories complete!" "success" 60
+                notify_sound "success"
+                send_webhook "complete" "DAVAI Complete!" "$done_count stories completed in ${elapsed}s"
+                emit_event "execution_complete" "{\"stories\":$done_count,\"elapsed\":$elapsed}"
                 break
             else
                 RUN_ACTIVE=0
                 show_notification "No actionable stories (some may be blocked)" "warning" 60
+                send_webhook "blocked" "DAVAI Blocked" "$remaining stories remaining but blocked"
                 break
             fi
         fi
 
         # Execute story
-        local title
+        local title tries
         title=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .title' "$PRD_FILE")
+        tries=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .tries // 0' "$PRD_FILE")
 
         mark_running "$next"
         mark_try "$next"
 
-        _log "Starting story $next: $title"
+        _log "[START] Story $next: $title (attempt $((tries + 1)))"
+        emit_event "story_start" "{\"id\":\"$next\",\"title\":\"$title\",\"attempt\":$((tries + 1))}"
 
         local result=0
+        local story_start
+        story_start=$(date +%s)
         execute_story "$next" || result=$?
+        local story_elapsed=$(( $(date +%s) - story_start ))
 
         if ((result == 0)); then
             if verify "$next"; then
                 local commit
                 commit=$(git rev-parse HEAD 2>/dev/null || echo "")
                 mark_done "$next" "$commit"
-                _log "Story $next complete"
+                learn_from_success "$next"
+                _log "[OK] Story $next complete in ${story_elapsed}s"
+                notify_sound "success"
+                send_webhook "story_done" "Story Complete" "$next: $title"
+                emit_event "story_complete" "{\"id\":\"$next\",\"elapsed\":$story_elapsed}"
                 fails=0
             else
                 mark_failed "$next"
-                _log "Story $next failed verification"
+                learn_from_failure "$next" "$RALPH_DIR/attempts/$next/attempt-*.log"
+                _log "[ERR] Story $next failed verification"
+                notify_sound "error"
+                send_webhook "story_failed" "Story Failed" "$next: Verification failed"
+                emit_event "story_failed" "{\"id\":\"$next\",\"reason\":\"verification\"}"
                 ((fails++))
+
+                # Try to split story if it failed too many times
+                local current_tries
+                current_tries=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .tries // 0' "$PRD_FILE")
+                if ((current_tries >= RALPH_MAX_TRIES - 1)); then
+                    _log "[HEAL] Story $next hit max tries, attempting split..."
+                    split_story "$next" && fails=0
+                fi
             fi
         elif ((result == 2)); then
-            _log "Story $next blocked"
+            _log "[BLOCK] Story $next blocked"
+            mark_blocked "$next" "Blocked by AI"
+            emit_event "story_blocked" "{\"id\":\"$next\"}"
             fails=0
         else
             mark_failed "$next"
-            _log "Story $next incomplete"
+            learn_from_failure "$next" "$RALPH_DIR/attempts/$next/attempt-*.log"
+            _log "[ERR] Story $next incomplete"
+            notify_sound "error"
+            emit_event "story_failed" "{\"id\":\"$next\",\"reason\":\"incomplete\"}"
             ((fails++))
+
+            # Try to split story if it failed too many times
+            local current_tries
+            current_tries=$(jq -r --arg id "$next" '.stories[] | select(.id == $id) | .tries // 0' "$PRD_FILE")
+            if ((current_tries >= RALPH_MAX_TRIES - 1)); then
+                _log "[HEAL] Story $next hit max tries, attempting split..."
+                split_story "$next" && fails=0
+            fi
         fi
 
         mark_stopped "$next"
@@ -1923,6 +1985,8 @@ run_execution_loop() {
         ((fails >= 5)) && {
             RUN_ACTIVE=0
             show_notification "Too many consecutive failures" "error" 60
+            notify_sound "error"
+            send_webhook "error" "DAVAI Error" "Too many consecutive failures"
             break
         }
 
@@ -1934,7 +1998,346 @@ run_execution_loop() {
 # Core Functions (imported from original script)
 #───────────────────────────────────────────────────────────────────────────────
 _ts() { date '+%H:%M:%S'; }
-_log() { [[ -n "$LOG_FILE" ]] && printf '[%s] %s\n' "$(_ts)" "$*" >> "$LOG_FILE"; }
+_date() { date '+%Y-%m-%d %H:%M:%S'; }
+_log() {
+    [[ -n "$LOG_FILE" ]] && printf '[%s] %s\n' "$(_ts)" "$*" >> "$LOG_FILE"
+    emit_event "log" "$*"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Event System & Webhooks
+#───────────────────────────────────────────────────────────────────────────────
+emit_event() {
+    local type="$1" data="${2:-}"
+    [[ -z "$EVENTS_FILE" ]] && return
+    printf '{"ts":"%s","type":"%s","data":%s}\n' \
+        "$(date -Iseconds)" "$type" "$(printf '%s' "$data" | jq -Rs .)" >> "$EVENTS_FILE"
+}
+
+send_webhook() {
+    [[ -z "$RALPH_WEBHOOK" ]] && return 0
+    local event="$1" title="$2" message="${3:-}" color="${4:-}"
+
+    local webhook_kind="$RALPH_WEBHOOK_KIND"
+    if [[ "$webhook_kind" == "auto" ]]; then
+        case "$RALPH_WEBHOOK" in
+            *slack.com*) webhook_kind="slack" ;;
+            *discord.com*) webhook_kind="discord" ;;
+            *) webhook_kind="generic" ;;
+        esac
+    fi
+
+    local payload
+    case "$webhook_kind" in
+        slack)
+            local emoji="📋"
+            case "$event" in
+                start) emoji="🚀" ;;
+                complete) emoji="✅" ;;
+                error) emoji="❌" ;;
+                story_done) emoji="✓" ;;
+                story_failed) emoji="⚠️" ;;
+            esac
+            payload=$(jq -n --arg e "$emoji" --arg t "$title" --arg m "$message" '{
+                blocks: [
+                    {type: "section", text: {type: "mrkdwn", text: ($e + " *" + $t + "*\n" + $m)}}
+                ]
+            }')
+            ;;
+        discord)
+            local discord_color=5814783
+            case "$event" in
+                complete) discord_color=5763719 ;;
+                error) discord_color=15548997 ;;
+                story_failed) discord_color=16776960 ;;
+            esac
+            payload=$(jq -n --arg t "$title" --arg m "$message" --argjson c "$discord_color" '{
+                embeds: [{title: $t, description: $m, color: $c}]
+            }')
+            ;;
+        *)
+            payload=$(jq -n --arg e "$event" --arg t "$title" --arg m "$message" \
+                '{event: $e, title: $t, message: $m, timestamp: now}')
+            ;;
+    esac
+
+    curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$RALPH_WEBHOOK" &>/dev/null &
+}
+
+notify_sound() {
+    local sound="${1:-default}"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        case "$sound" in
+            success) afplay /System/Library/Sounds/Glass.aiff 2>/dev/null & ;;
+            error) afplay /System/Library/Sounds/Basso.aiff 2>/dev/null & ;;
+            *) afplay /System/Library/Sounds/Pop.aiff 2>/dev/null & ;;
+        esac
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Usage Tracking & Cost Estimation
+#───────────────────────────────────────────────────────────────────────────────
+track_usage() {
+    ((RALPH_USAGE_TRACKING == 0)) && return 0
+    local story_id="$1" input_tokens="${2:-0}" output_tokens="${3:-0}"
+    local usage_file="$RALPH_DIR/usage.jsonl"
+
+    # Estimate cost (Claude Sonnet pricing approximation)
+    local input_cost output_cost total_cost
+    input_cost=$(echo "scale=6; $input_tokens * 0.000003" | bc 2>/dev/null || echo "0")
+    output_cost=$(echo "scale=6; $output_tokens * 0.000015" | bc 2>/dev/null || echo "0")
+    total_cost=$(echo "scale=6; $input_cost + $output_cost" | bc 2>/dev/null || echo "0")
+
+    printf '{"ts":"%s","story":"%s","input_tokens":%d,"output_tokens":%d,"total_tokens":%d,"est_cost":"%.4f"}\n' \
+        "$(date -Iseconds)" "$story_id" "$input_tokens" "$output_tokens" "$((input_tokens + output_tokens))" "$total_cost" \
+        >> "$usage_file"
+}
+
+get_total_usage() {
+    local usage_file="$RALPH_DIR/usage.jsonl"
+    [[ ! -f "$usage_file" ]] && echo "0|0|0.0000" && return
+    jq -s '{
+        input: ([.[].input_tokens] | add // 0),
+        output: ([.[].output_tokens] | add // 0),
+        cost: ([.[].est_cost | select(. != "") | tonumber] | add // 0)
+    } | "\(.input)|\(.output)|\(.cost)"' "$usage_file" 2>/dev/null | tr -d '"' || echo "0|0|0.0000"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Memory & Learning System
+#───────────────────────────────────────────────────────────────────────────────
+remember() {
+    local category="$1" content="$2"
+    local memory_file="$RALPH_DIR/memory.md"
+    printf '\n## [%s] %s\n%s\n' "$(date '+%Y-%m-%d %H:%M')" "$category" "$content" >> "$memory_file"
+}
+
+learn_from_failure() {
+    local story_id="$1" error_log="$2"
+    remember "FAILURE: $story_id" "Error encountered:\n\`\`\`\n$(tail -20 "$error_log" 2>/dev/null)\n\`\`\`"
+    _log "[LEARN] Recorded failure pattern for $story_id"
+}
+
+learn_from_success() {
+    local story_id="$1"
+    local story_title
+    story_title=$(jq -r --arg id "$story_id" '.stories[] | select(.id == $id) | .title' "$PRD_FILE" 2>/dev/null)
+    remember "SUCCESS: $story_id" "Completed: $story_title"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Story Splitting (Self-Healing)
+#───────────────────────────────────────────────────────────────────────────────
+split_story() {
+    local story_id="$1"
+    _log "[SPLIT] Attempting to split story $story_id"
+
+    local story
+    story=$(jq -c --arg id "$story_id" '.stories[] | select(.id == $id)' "$PRD_FILE")
+    [[ -z "$story" ]] && return 1
+
+    local title why
+    title=$(echo "$story" | jq -r '.title')
+    why=$(echo "$story" | jq -r '.why')
+
+    local prompt="The following story failed multiple times and needs to be split into smaller, atomic sub-stories:
+
+## Original Story
+ID: $story_id
+Title: $title
+Why: $why
+
+## Instructions
+Split this into 2-3 smaller stories that are each independently completable.
+Return JSON array of new stories with id, title, why, criteria, files, deps fields.
+Use IDs like ${story_id}a, ${story_id}b, etc.
+
+Return ONLY valid JSON array."
+
+    local raw_output
+    raw_output=$(printf '%s' "$prompt" | with_timeout 120 "$RALPH_CLAUDE" --print 2>/dev/null)
+
+    local new_stories
+    if new_stories=$(echo "$raw_output" | json_extract 2>/dev/null); then
+        # Mark original as blocked and add new stories
+        jq_inplace "$PRD_FILE" --arg id "$story_id" --argjson new "$new_stories" '
+            .stories |= map(if .id == $id then . + {blocked: true, notes: "Split into sub-stories"} else . end) |
+            .stories += ($new | map(. + {done: false, tries: 0, blocked: false, running: false}))
+        '
+        _log "[SPLIT] Successfully split $story_id into $(echo "$new_stories" | jq 'length') sub-stories"
+        emit_event "story_split" "{\"id\":\"$story_id\",\"count\":$(echo "$new_stories" | jq 'length')}"
+        return 0
+    fi
+
+    _log "[SPLIT] Failed to split $story_id"
+    return 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PR Summary Generation
+#───────────────────────────────────────────────────────────────────────────────
+generate_pr_summary() {
+    local pr_file="$RALPH_DIR/pr_summary.md"
+
+    local feature_name total_stories done_stories
+    feature_name=$(jq -r '.feature' "$PRD_FILE" 2>/dev/null || echo "Feature")
+    total_stories=$(jq '.stories | length' "$PRD_FILE" 2>/dev/null || echo 0)
+    done_stories=$(jq '[.stories[] | select(.done)] | length' "$PRD_FILE" 2>/dev/null || echo 0)
+
+    local commits
+    commits=$(git log --oneline -20 2>/dev/null | head -10 || echo "No commits found")
+
+    local files_changed
+    files_changed=$(git diff --stat HEAD~"$done_stories" 2>/dev/null | tail -1 || echo "Unknown")
+
+    cat > "$pr_file" << EOF
+# $feature_name
+
+## Summary
+This PR implements **$feature_name** through $done_stories automated stories.
+
+## Changes
+$files_changed
+
+## Stories Completed
+$(jq -r '.stories[] | select(.done) | "- [x] \(.id): \(.title)"' "$PRD_FILE" 2>/dev/null)
+
+## Stories Remaining
+$(jq -r '.stories[] | select(.done | not) | select(.blocked | not) | "- [ ] \(.id): \(.title)"' "$PRD_FILE" 2>/dev/null)
+
+## Recent Commits
+\`\`\`
+$commits
+\`\`\`
+
+## Verification
+- Typecheck: ${TYPE_CMD:-N/A}
+- Tests: ${TEST_CMD:-N/A}
+- Lint: ${LINT_CMD:-N/A}
+
+---
+*Generated by DAVAI - давай, ральф, давай! 🚀*
+EOF
+
+    _log "[PR] Generated PR summary at $pr_file"
+    echo "$pr_file"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# Parallel Execution with Worktrees
+#───────────────────────────────────────────────────────────────────────────────
+setup_worktree() {
+    local story_id="$1"
+    local branch_name="ralph/$story_id"
+    local worktree_path="$RALPH_WORKTREE_ROOT/$story_id"
+
+    mkdir -p "$RALPH_WORKTREE_ROOT"
+
+    # Create branch if not exists
+    git branch "$branch_name" 2>/dev/null || true
+
+    # Create worktree
+    if git worktree add "$worktree_path" "$branch_name" 2>/dev/null; then
+        echo "$worktree_path"
+        return 0
+    fi
+
+    return 1
+}
+
+cleanup_worktree() {
+    local story_id="$1"
+    local worktree_path="$RALPH_WORKTREE_ROOT/$story_id"
+    local branch_name="ralph/$story_id"
+
+    git worktree remove "$worktree_path" --force 2>/dev/null || true
+    git branch -D "$branch_name" 2>/dev/null || true
+}
+
+merge_worktree() {
+    local story_id="$1"
+    local worktree_path="$RALPH_WORKTREE_ROOT/$story_id"
+    local branch_name="ralph/$story_id"
+
+    # Merge changes back
+    git merge "$branch_name" --no-edit 2>/dev/null || {
+        _log "[WORKTREE] Merge conflict for $story_id"
+        return 1
+    }
+
+    cleanup_worktree "$story_id"
+    return 0
+}
+
+run_parallel_stories() {
+    local max_parallel="$RALPH_PARALLEL"
+    ((max_parallel <= 1)) && return 1
+
+    local -a running_pids=()
+    local -a running_stories=()
+
+    while true; do
+        # Clean up finished jobs
+        for i in "${!running_pids[@]}"; do
+            if ! kill -0 "${running_pids[$i]}" 2>/dev/null; then
+                wait "${running_pids[$i]}" 2>/dev/null || true
+                unset "running_pids[$i]" "running_stories[$i]"
+            fi
+        done
+        running_pids=("${running_pids[@]}")
+        running_stories=("${running_stories[@]}")
+
+        # Get next stories if we have capacity
+        while ((${#running_pids[@]} < max_parallel)); do
+            local next
+            next=$(get_next_story)
+            [[ -z "$next" ]] && break
+
+            # Skip if already running
+            local already_running=0
+            for s in "${running_stories[@]}"; do
+                [[ "$s" == "$next" ]] && { already_running=1; break; }
+            done
+            ((already_running)) && continue
+
+            # Start in background
+            (
+                if ((RALPH_ISOLATE)); then
+                    local wt
+                    wt=$(setup_worktree "$next")
+                    if [[ -n "$wt" ]]; then
+                        cd "$wt" && execute_story "$next"
+                        merge_worktree "$next"
+                    else
+                        execute_story "$next"
+                    fi
+                else
+                    execute_story "$next"
+                fi
+            ) &
+
+            running_pids+=($!)
+            running_stories+=("$next")
+            mark_running "$next"
+            _log "[PARALLEL] Started story $next (${#running_pids[@]}/$max_parallel slots)"
+        done
+
+        # Check if we're done
+        ((${#running_pids[@]} == 0)) && {
+            local remaining
+            remaining=$(remaining_count)
+            ((remaining == 0)) && break
+
+            # No more actionable stories
+            local next
+            next=$(get_next_story)
+            [[ -z "$next" ]] && break
+        }
+
+        sleep 2
+    done
+}
 
 slugify() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40
